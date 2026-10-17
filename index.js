@@ -1,11 +1,16 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const {
   Client,
+  Events,
   GatewayIntentBits,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   EmbedBuilder,
+  InteractionContextType,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -14,24 +19,52 @@ const {
   MessageFlags,
 } = require('discord.js');
 
-const { DISCORD_TOKEN, GUILD_ID, STAFF_CHANNEL_ID, ROBLOX_GROUP_ID } = process.env;
-for (const [k, v] of Object.entries({ DISCORD_TOKEN, GUILD_ID, STAFF_CHANNEL_ID, ROBLOX_GROUP_ID })) {
-  if (!v) throw new Error(`Missing ${k} in .env`);
-}
+const { DISCORD_TOKEN } = process.env;
+if (!DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN in .env');
 
-const GROUP_URL = `https://www.roblox.com/groups/${ROBLOX_GROUP_ID}`;
 const PENDING_TTL_MS = 15 * 60 * 1000;
 
-// discordUserId -> { robloxId, robloxName, displayName, avatar, createdAt }
+/* --------------------------- Per-server config --------------------------- */
+// { [guildId]: { staffChannelId, groupId, groupName } }
+
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const CONFIG_FILE = path.join(DATA_DIR, 'guilds.json');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+let configs = {};
+try {
+  configs = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+} catch {
+  configs = {};
+}
+
+function saveConfigs() {
+  const tmp = `${CONFIG_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(configs, null, 2));
+  fs.renameSync(tmp, CONFIG_FILE);
+}
+
+/* ------------------------------ Pending state --------------------------- */
+// `${guildId}:${userId}` -> { robloxId, robloxName, displayName, avatar, membership, createdAt }
+
 const pending = new Map();
+const pkey = (i) => `${i.guildId}:${i.user.id}`;
+
+function getPending(i) {
+  const p = pending.get(pkey(i));
+  if (!p) return null;
+  if (Date.now() - p.createdAt > PENDING_TTL_MS) {
+    pending.delete(pkey(i));
+    return null;
+  }
+  return p;
+}
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 /* ------------------------------ Roblox API ------------------------------ */
 
-async function robloxFetch(url, options = {}) {
-  return fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
-}
+const robloxFetch = (url, options = {}) => fetch(url, { ...options, signal: AbortSignal.timeout(8000) });
 
 // Returns { id, name, displayName } or null if the username doesn't exist.
 async function getRobloxUser(username) {
@@ -58,14 +91,22 @@ async function getHeadshot(userId) {
   }
 }
 
+// Returns group info, or null if the group doesn't exist. Throws on API failure.
+async function getGroup(groupId) {
+  const res = await robloxFetch(`https://groups.roblox.com/v1/groups/${groupId}`);
+  if (res.status === 400 || res.status === 404) return null;
+  if (!res.ok) throw new Error(`Roblox groups API returned ${res.status}`);
+  return res.json();
+}
+
 // Returns the role name if a member, false if definitely not a member,
 // or null if membership couldn't be checked (API error, rate limit, etc.).
-async function checkGroupMembership(userId) {
+async function checkGroupMembership(userId, groupId) {
   try {
     const res = await robloxFetch(`https://groups.roblox.com/v2/users/${userId}/groups/roles`);
     if (!res.ok) return null;
     const { data } = await res.json();
-    const entry = data?.find((g) => String(g.group.id) === String(ROBLOX_GROUP_ID));
+    const entry = data?.find((g) => String(g.group.id) === String(groupId));
     return entry ? entry.role.name : false;
   } catch {
     return null;
@@ -74,11 +115,15 @@ async function checkGroupMembership(userId) {
 
 /* ------------------------------ UI builders ----------------------------- */
 
-const applyPanel = () => ({
+const notice = (text) => ({ content: text, embeds: [], components: [] });
+const ephemeral = (content) => ({ content, flags: MessageFlags.Ephemeral });
+const groupUrl = (cfg) => `https://www.roblox.com/groups/${cfg.groupId}`;
+
+const applyPanel = (guildName) => ({
   embeds: [
     new EmbedBuilder()
       .setTitle('Playtester Applications')
-      .setDescription('Want to help test our games before release? Click the button below to apply.')
+      .setDescription(`Want to help test games for **${guildName}**? Click the button below to apply.`)
       .setColor(0x5865f2),
   ],
   components: [
@@ -88,20 +133,20 @@ const applyPanel = () => ({
   ],
 });
 
-const joinStep = (p) => ({
+const joinStep = (p, cfg) => ({
   embeds: [
     new EmbedBuilder()
       .setTitle('Step 3: Join our Roblox group')
       .setDescription(
         `Found **${p.robloxName}** (ID \`${p.robloxId}\`).\n\n` +
-          `Join the group using the button below, then come back and click **I've Joined**.`
+          `Join **${cfg.groupName}** using the button below, then come back and click **I've Joined**.`
       )
       .setThumbnail(p.avatar)
       .setColor(0x5865f2),
   ],
   components: [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setLabel('Join Roblox Group').setStyle(ButtonStyle.Link).setURL(GROUP_URL),
+      new ButtonBuilder().setLabel('Join Roblox Group').setStyle(ButtonStyle.Link).setURL(groupUrl(cfg)),
       new ButtonBuilder().setCustomId('pt_joined').setLabel("I've Joined").setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('pt_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
     ),
@@ -117,7 +162,7 @@ const consentStep = (p, note) => ({
           `By clicking **Yes, I agree**, you confirm that:\n` +
           `• the Roblox account **${p.robloxName}** is yours,\n` +
           `• you agree to follow the playtesting rules, and\n` +
-          `• you agree to share your Discord and Roblox details with our staff for this application.`
+          `• you agree to share your Discord and Roblox details with this server's staff for this application.`
       )
       .setThumbnail(p.avatar)
       .setColor(0xfaa61a),
@@ -130,21 +175,76 @@ const consentStep = (p, note) => ({
   ],
 });
 
-const notice = (text) => ({ content: text, embeds: [], components: [] });
+/* ------------------------------ Admin commands -------------------------- */
 
-/* ------------------------------ Handlers -------------------------------- */
+const isAdmin = (i) => i.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
 
-function getPending(userId) {
-  const p = pending.get(userId);
-  if (!p) return null;
-  if (Date.now() - p.createdAt > PENDING_TTL_MS) {
-    pending.delete(userId);
-    return null;
+async function handleSetup(interaction) {
+  if (!isAdmin(interaction)) return interaction.reply(ephemeral('You need the **Manage Server** permission to do that.'));
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const channel = interaction.options.getChannel('staff_channel', true);
+  const groupId = interaction.options.getInteger('roblox_group_id', true);
+
+  const me = interaction.guild.members.me ?? (await interaction.guild.members.fetchMe());
+  const perms = channel.permissionsFor(me);
+  const missing = ['ViewChannel', 'SendMessages', 'EmbedLinks'].filter((n) => !perms?.has(PermissionFlagsBits[n]));
+  if (missing.length) {
+    return interaction.editReply(
+      `I'm missing permissions in ${channel}: **${missing.join(', ')}**. Grant them and run \`/setup\` again.`
+    );
   }
-  return p;
+
+  let group;
+  try {
+    group = await getGroup(groupId);
+  } catch (err) {
+    console.error(err);
+    return interaction.editReply("Roblox didn't respond while I was checking that group. Try again in a minute.");
+  }
+  if (!group) {
+    return interaction.editReply(
+      `I couldn't find a Roblox group with ID \`${groupId}\`. The ID is the number in your group's URL (roblox.com/groups/**ID**/...).`
+    );
+  }
+
+  configs[interaction.guildId] = { staffChannelId: channel.id, groupId, groupName: group.name };
+  saveConfigs();
+
+  await interaction.editReply(
+    `✅ Setup complete.\n• Applications go to ${channel}\n• Roblox group: **${group.name}** (\`${groupId}\`)\n\n` +
+      `Now run \`/panel\` in the channel where people should apply.`
+  );
 }
 
+async function handleConfig(interaction) {
+  if (!isAdmin(interaction)) return interaction.reply(ephemeral('You need the **Manage Server** permission to do that.'));
+  const cfg = configs[interaction.guildId];
+  if (!cfg) return interaction.reply(ephemeral('This server isn\'t set up yet. Run `/setup` first.'));
+  return interaction.reply(
+    ephemeral(
+      `**Staff channel:** <#${cfg.staffChannelId}>\n**Roblox group:** [${cfg.groupName}](${groupUrl(cfg)}) (\`${cfg.groupId}\`)`
+    )
+  );
+}
+
+async function handlePanel(interaction) {
+  if (!isAdmin(interaction)) return interaction.reply(ephemeral('You need the **Manage Server** permission to do that.'));
+  if (!configs[interaction.guildId]) return interaction.reply(ephemeral('Run `/setup` first so I know where to send applications.'));
+  try {
+    await interaction.channel.send(applyPanel(interaction.guild.name));
+  } catch {
+    return interaction.reply(ephemeral("I can't send messages in this channel. Give me **Send Messages** and **Embed Links** here."));
+  }
+  return interaction.reply(ephemeral('Panel posted.'));
+}
+
+/* ------------------------------ Applicant flow -------------------------- */
+
 async function handleApplyButton(interaction) {
+  if (!configs[interaction.guildId]) {
+    return interaction.reply(ephemeral('Applications aren\'t set up in this server yet. Ask an admin to run `/setup`.'));
+  }
   const modal = new ModalBuilder().setCustomId('pt_username').setTitle('Playtester Application');
   modal.addComponents(
     new ActionRowBuilder().addComponents(
@@ -162,10 +262,12 @@ async function handleApplyButton(interaction) {
 
 async function handleUsernameModal(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const username = interaction.fields.getTextInputValue('roblox_username').trim();
+  const cfg = configs[interaction.guildId];
+  if (!cfg) return interaction.editReply(notice('Applications aren\'t set up in this server. Ask an admin to run `/setup`.'));
 
+  const username = interaction.fields.getTextInputValue('roblox_username').trim();
   if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) {
-    return interaction.editReply(notice('That doesn\'t look like a valid Roblox username. Click **Apply** to try again.'));
+    return interaction.editReply(notice("That doesn't look like a valid Roblox username. Click **Apply** to try again."));
   }
 
   let user;
@@ -173,7 +275,7 @@ async function handleUsernameModal(interaction) {
     user = await getRobloxUser(username);
   } catch (err) {
     console.error(err);
-    return interaction.editReply(notice('Roblox didn\'t respond. Please try again in a minute.'));
+    return interaction.editReply(notice("Roblox didn't respond. Please try again in a minute."));
   }
   if (!user) {
     return interaction.editReply(notice(`I couldn't find a Roblox user named **${username}**. Check the spelling and try again.`));
@@ -186,21 +288,22 @@ async function handleUsernameModal(interaction) {
     avatar: await getHeadshot(user.id),
     createdAt: Date.now(),
   };
-  pending.set(interaction.user.id, p);
-  await interaction.editReply(joinStep(p));
+  pending.set(pkey(interaction), p);
+  await interaction.editReply(joinStep(p, cfg));
 }
 
 async function handleJoinedButton(interaction) {
-  const p = getPending(interaction.user.id);
-  if (!p) return interaction.update(notice('This application expired. Click **Apply for Playtester** to start again.'));
+  const cfg = configs[interaction.guildId];
+  const p = getPending(interaction);
+  if (!cfg || !p) return interaction.update(notice('This application expired. Click **Apply for Playtester** to start again.'));
 
   await interaction.deferUpdate();
-  const membership = await checkGroupMembership(p.robloxId);
+  const membership = await checkGroupMembership(p.robloxId, cfg.groupId);
 
   if (membership === false) {
     return interaction.editReply({
-      ...joinStep(p),
-      content: "I can't see **" + p.robloxName + '** in the group yet. Join it, wait a few seconds, then click **I\'ve Joined** again.',
+      ...joinStep(p, cfg),
+      content: `I can't see **${p.robloxName}** in the group yet. Join it, wait a few seconds, then click **I've Joined** again.`,
     });
   }
 
@@ -213,15 +316,18 @@ async function handleJoinedButton(interaction) {
 }
 
 async function handleAgreeButton(interaction) {
-  const p = getPending(interaction.user.id);
-  if (!p || !p.membership) {
+  const cfg = configs[interaction.guildId];
+  const p = getPending(interaction);
+  if (!cfg || !p || !p.membership) {
     return interaction.update(notice('This application expired. Click **Apply for Playtester** to start again.'));
   }
 
-  const channel = await client.channels.fetch(STAFF_CHANNEL_ID).catch(() => null);
+  const channel = await client.channels.fetch(cfg.staffChannelId).catch(() => null);
   if (!channel?.isTextBased()) {
-    console.error('Staff channel not found or not text-based.');
-    return interaction.update(notice('Something went wrong sending your application. Please contact staff.'));
+    console.error(`Staff channel missing for guild ${interaction.guildId}`);
+    return interaction.update(
+      notice("I couldn't deliver your application because the staff channel is unavailable. Please tell an admin to re-run `/setup`.")
+    );
   }
 
   const unix = Math.floor(Date.now() / 1000);
@@ -237,7 +343,7 @@ async function handleAgreeButton(interaction) {
         inline: true,
       },
       { name: 'Roblox User ID', value: `\`${p.robloxId}\``, inline: true },
-      { name: 'Group Membership', value: p.membership },
+      { name: 'Group Membership', value: `${p.membership}\nGroup: ${cfg.groupName}` },
       { name: 'Consent', value: '✅ Agreed to playtesting rules and data sharing' },
       { name: 'Applied', value: `<t:${unix}:F> (<t:${unix}:R>)` }
     )
@@ -247,37 +353,74 @@ async function handleAgreeButton(interaction) {
     await channel.send({ embeds: [embed] });
   } catch (err) {
     console.error(err);
-    return interaction.update(notice('Something went wrong sending your application. Please contact staff.'));
+    return interaction.update(notice("I couldn't deliver your application. Please tell an admin to check my permissions in the staff channel."));
   }
 
-  pending.delete(interaction.user.id);
+  pending.delete(pkey(interaction));
   await interaction.update(notice('🎉 Your application has been submitted! Staff will review it and get back to you.'));
 }
 
 async function handleCancelButton(interaction) {
-  pending.delete(interaction.user.id);
+  pending.delete(pkey(interaction));
   await interaction.update(notice('Application cancelled. You can apply again any time.'));
 }
 
 /* ------------------------------ Wiring ---------------------------------- */
 
-client.once('clientReady', async () => {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.commands.set([
-    new SlashCommandBuilder()
-      .setName('playtester-panel')
-      .setDescription('Post the playtester application panel in this channel')
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-      .toJSON(),
-  ]);
-  console.log(`Logged in as ${client.user.tag}`);
+const commands = [
+  new SlashCommandBuilder()
+    .setName('setup')
+    .setDescription('Configure playtester applications for this server')
+    .addChannelOption((o) =>
+      o
+        .setName('staff_channel')
+        .setDescription('Private channel where applications are sent')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+        .setRequired(true)
+    )
+    .addIntegerOption((o) =>
+      o
+        .setName('roblox_group_id')
+        .setDescription('Your Roblox group ID (the number in the group URL)')
+        .setMinValue(1)
+        .setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setContexts(InteractionContextType.Guild),
+  new SlashCommandBuilder()
+    .setName('panel')
+    .setDescription('Post the playtester application button in this channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setContexts(InteractionContextType.Guild),
+  new SlashCommandBuilder()
+    .setName('config')
+    .setDescription('Show this server\'s playtester settings')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .setContexts(InteractionContextType.Guild),
+].map((c) => c.toJSON());
+
+client.once(Events.ClientReady, async () => {
+  await client.application.commands.set(commands); // global: works in every server
+  console.log(`Logged in as ${client.user.tag} in ${client.guilds.cache.size} server(s)`);
 });
 
-client.on('interactionCreate', async (interaction) => {
+client.on(Events.GuildDelete, (guild) => {
+  if (configs[guild.id]) {
+    delete configs[guild.id];
+    saveConfigs();
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (interaction.isChatInputCommand() && interaction.commandName === 'playtester-panel') {
-      await interaction.channel.send(applyPanel());
-      return interaction.reply({ content: 'Panel posted.', flags: MessageFlags.Ephemeral });
+    if (!interaction.inGuild()) return;
+
+    if (interaction.isChatInputCommand()) {
+      switch (interaction.commandName) {
+        case 'setup': return await handleSetup(interaction);
+        case 'panel': return await handlePanel(interaction);
+        case 'config': return await handleConfig(interaction);
+      }
     }
     if (interaction.isButton()) {
       switch (interaction.customId) {
@@ -292,7 +435,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (err) {
     console.error('Interaction error:', err);
-    const msg = { content: 'Something went wrong. Please try again.', flags: MessageFlags.Ephemeral };
+    const msg = ephemeral('Something went wrong. Please try again.');
     if (interaction.deferred || interaction.replied) interaction.followUp(msg).catch(() => {});
     else interaction.reply(msg).catch(() => {});
   }
