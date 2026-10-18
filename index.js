@@ -19,6 +19,14 @@ const {
   MessageFlags,
 } = require('discord.js');
 
+const http = require('http');
+
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Bot is running');
+}).listen(PORT, () => console.log(`Listening on port ${PORT}`));
+
 const { DISCORD_TOKEN } = process.env;
 if (!DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN in .env');
 
